@@ -85,7 +85,12 @@ cython_debug/
 
 # uv
 .uv/
-uv.lock
+
+# Ruff cache
+.ruff_cache/
+
+# SQLite database
+*.db
 
 # IDE
 .idea/
