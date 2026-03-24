@@ -546,20 +546,10 @@ def convert_pdf_to_word_doctr(input_path: Path, output_path: Path) -> None:
                                     'center_y': (y_min + y_max) / 2
                                 })
 
-        # Extract images with normalized positions
-        page_images = extract_images_from_page(page)
+        # NOTE: Image extraction disabled - it was incorrectly adding full-page
+        # screenshots to documents. The OCR text extraction is sufficient.
+        # page_images = extract_images_from_page(page)
         images_with_pos = []
-        for img_info in page_images:
-            x0, y0, x1, y1 = img_info['bbox']
-            images_with_pos.append({
-                'bytes': img_info['bytes'],
-                'bbox': img_info['bbox'],
-                'y_norm': y0 / page_height,
-                'x_min_norm': x0 / page_width,
-                'x_max_norm': x1 / page_width,
-                'width': x1 - x0,
-                'height': y1 - y0
-            })
 
         # Group words into rows
         rows = detect_table_rows_from_words(all_words)
@@ -580,7 +570,14 @@ def convert_pdf_to_word_doctr(input_path: Path, output_path: Path) -> None:
             footer_rows_first_page = footer_rows.copy()
 
         # Add header images first (top 25% of page)
-        header_images = [img for img in images_with_pos if img['y_norm'] < 0.25]
+        # Filter out full-page images (likely page screenshots, not actual logos)
+        # Only add images that are small enough to be actual logos/headers
+        header_images = [
+            img for img in images_with_pos
+            if img['y_norm'] < 0.25
+            and img['width'] < page_width * 0.5  # Less than 50% of page width
+            and img['height'] < page_height * 0.3  # Less than 30% of page height
+        ]
         for img_info in header_images:
             try:
                 img_stream = BytesIO(img_info['bytes'])
@@ -607,7 +604,9 @@ def convert_pdf_to_word_doctr(input_path: Path, output_path: Path) -> None:
                 if gap > 0.015:
                     gaps.append(gap)
 
-            has_columns = len(gaps) >= 3  # At least 4 columns
+            # Require at least 4 columns AND 4+ words in row to be considered a table row
+            # This prevents regular paragraph text from being detected as tables
+            has_columns = len(gaps) >= 3 and len(row) >= 4
 
             if has_columns:
                 # Flush pending non-table rows
@@ -624,8 +623,15 @@ def convert_pdf_to_word_doctr(input_path: Path, output_path: Path) -> None:
                     table_start = i
                 table_rows_collected.append(row)
             else:
-                if table_rows_collected and len(table_rows_collected) >= 2:
-                    _add_table_to_doc(word_doc, table_rows_collected)
+                # Require at least 3 rows with consistent column counts to form a table
+                if table_rows_collected and len(table_rows_collected) >= 3:
+                    # Verify rows have similar word counts (within 2) for consistent structure
+                    word_counts = [len(r) for r in table_rows_collected]
+                    if max(word_counts) - min(word_counts) <= 2:
+                        _add_table_to_doc(word_doc, table_rows_collected)
+                    else:
+                        # Not a real table, treat as regular text
+                        non_table_rows.extend(table_rows_collected)
                     table_rows_collected = []
                     table_start = None
                 elif table_rows_collected:
@@ -635,8 +641,12 @@ def convert_pdf_to_word_doctr(input_path: Path, output_path: Path) -> None:
                 non_table_rows.append(row)
 
         # Handle remaining table rows
-        if table_rows_collected and len(table_rows_collected) >= 2:
-            _add_table_to_doc(word_doc, table_rows_collected)
+        if table_rows_collected and len(table_rows_collected) >= 3:
+            word_counts = [len(r) for r in table_rows_collected]
+            if max(word_counts) - min(word_counts) <= 2:
+                _add_table_to_doc(word_doc, table_rows_collected)
+            else:
+                non_table_rows.extend(table_rows_collected)
         elif table_rows_collected:
             non_table_rows.extend(table_rows_collected)
 
@@ -823,12 +833,22 @@ def validate_input_file(filepath: Path, conversion_type: ConversionType) -> None
 
 
 def is_image_based_pdf(pdf_doc) -> bool:
-    """Check if PDF is image-based (scanned) with no extractable text."""
+    """Check if PDF is image-based (scanned) with no extractable text.
+
+    A PDF is considered image-based if it has very little extractable text
+    relative to its page count. We use a higher threshold to avoid false
+    positives on text-based PDFs with embedded fonts or encoding issues.
+    """
     total_text = ""
-    for page_num in range(min(3, len(pdf_doc))):  # Check first 3 pages
+    pages_to_check = min(3, len(pdf_doc))
+    for page_num in range(pages_to_check):
         page = pdf_doc[page_num]
         total_text += page.get_text()
-    return len(total_text.strip()) < 50  # Less than 50 chars = image-based
+
+    # Use a per-page threshold: less than 100 chars per page average = image-based
+    # This is more robust than a fixed threshold
+    avg_chars_per_page = len(total_text.strip()) / max(pages_to_check, 1)
+    return avg_chars_per_page < 100
 
 
 def detect_tables_opencv(img_array: np.ndarray, scale_factor: float = 1.0):
@@ -1195,47 +1215,382 @@ def convert_pdf_to_word_pdf2docx(input_path: Path, output_path: Path) -> None:
     """Convert PDF to Word using pdf2docx for high-fidelity layout preservation.
 
     This preserves tables, images, text formatting, and layout positioning.
+    Enhanced to also extract images and render vector graphics (like barcodes).
     """
     logger.info("Using pdf2docx for high-fidelity conversion")
+
+    # First, do the basic pdf2docx conversion
     cv = Pdf2DocxConverter(str(input_path))
     cv.convert(str(output_path))
     cv.close()
 
+    # NOTE: Image enhancement disabled - it was incorrectly adding page screenshots
+    # to documents. The pdf2docx library already handles images properly.
+    # If needed in the future for barcodes/logos, the _enhance_docx_with_pdf_images
+    # function needs to be more selective about what images it adds.
 
-def convert_pdf_to_word(input_path: Path, output_path: Path) -> None:
+
+def _enhance_docx_with_pdf_images(pdf_path: Path, docx_path: Path) -> None:
+    """Extract missing images from PDF and add them to the Word document.
+
+    Only adds barcode and logo images - does NOT duplicate text content.
+    """
+    import fitz
+    from docx import Document
+    from docx.shared import Inches, Pt, Cm
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    pdf_doc = fitz.open(str(pdf_path))
+    word_doc = Document(str(docx_path))
+
+    page = pdf_doc[0]
+    page_width = page.rect.width
+    page_height = page.rect.height
+
+    images_to_add = []
+
+    # 1. Extract raster images (like logo)
+    for img in page.get_images():
+        xref = img[0]
+        try:
+            base_image = pdf_doc.extract_image(xref)
+            if base_image:
+                for img_rect in page.get_image_rects(xref):
+                    # Only header images (top 15%)
+                    if img_rect.y0 < page_height * 0.15:
+                        images_to_add.append({
+                            'bytes': base_image['image'],
+                            'rect': img_rect,
+                            'type': 'logo'
+                        })
+        except Exception as e:
+            logger.warning(f"Failed to extract image: {e}")
+
+    # 2. Detect and render barcode (vector graphics)
+    drawings = page.get_drawings()
+    if drawings:
+        header_y_limit = page_height * 0.15
+        barcode_lines = []
+
+        for d in drawings:
+            if d.get('type') != 's':
+                continue
+            items = d.get('items', [])
+            if len(items) != 1 or items[0][0] != 'l':
+                continue
+            rect = d.get('rect')
+            if not rect or rect.y0 > header_y_limit:
+                continue
+            width = rect.x1 - rect.x0
+            height = rect.y1 - rect.y0
+            if width < 5 and height > 20:
+                barcode_lines.append(rect)
+
+        if len(barcode_lines) > 20:
+            x_coords = [r.x0 for r in barcode_lines] + [r.x1 for r in barcode_lines]
+            y_coords = [r.y0 for r in barcode_lines] + [r.y1 for r in barcode_lines]
+
+            barcode_rect = fitz.Rect(
+                min(x_coords) - 5, min(y_coords) - 5,
+                max(x_coords) + 5, max(y_coords) + 25
+            )
+
+            mat = fitz.Matrix(3, 3)
+            pix = page.get_pixmap(matrix=mat, clip=barcode_rect, alpha=False)
+
+            images_to_add.append({
+                'bytes': pix.tobytes("png"),
+                'rect': barcode_rect,
+                'type': 'barcode'
+            })
+
+    # Sort by x position (left to right)
+    images_to_add.sort(key=lambda x: x['rect'].x0)
+
+    # Add images to the first paragraph (creates a header row)
+    if images_to_add:
+        first_para = word_doc.paragraphs[0]
+
+        # Insert a new paragraph for the images
+        img_para = first_para.insert_paragraph_before("")
+
+        for img_info in images_to_add:
+            img_stream = BytesIO(img_info['bytes'])
+            rect = img_info['rect']
+
+            # Calculate size based on original proportions
+            width_ratio = (rect.x1 - rect.x0) / page_width
+            width_inches = width_ratio * 6.5  # 6.5 inch page width
+            width_inches = max(0.8, min(width_inches, 2.0))  # Clamp between 0.8 and 2 inches
+
+            run = img_para.add_run()
+            run.add_picture(img_stream, width=Inches(width_inches))
+            run.add_text("  ")  # Space between images
+
+            logger.info(f"Added {img_info['type']} image, width={width_inches:.2f}in")
+
+        img_para.paragraph_format.space_after = Pt(6)
+
+    pdf_doc.close()
+    word_doc.save(str(docx_path))
+    logger.info("Image enhancement complete")
+
+
+def convert_pdf_to_word_marker(input_path: Path, output_path: Path) -> None:
+    """Convert PDF to Word using marker-pdf for professional-grade layout preservation.
+
+    marker-pdf is an ML-based tool that provides excellent structure preservation
+    for tables, images, equations, and complex layouts. Similar to what Adobe uses.
+    """
+    logger.info("Using marker-pdf for professional-grade conversion")
+
+    try:
+        from marker.converters.pdf import PdfConverter
+        from marker.models import create_model_dict
+        from marker.output import text_from_rendered
+        import re
+
+        # Initialize marker converter with models
+        logger.info("Initializing marker-pdf models...")
+        converter = PdfConverter(create_model_dict())
+
+        # Convert PDF to structured output
+        logger.info(f"Converting {input_path} with marker-pdf...")
+        rendered = converter(str(input_path))
+        markdown_text, _, images = text_from_rendered(rendered)
+
+        logger.info(f"marker-pdf extracted {len(images)} images")
+
+        # Create temp directory for images
+        temp_img_dir = OUTPUT_DIR / f"marker_images_{input_path.stem}"
+        temp_img_dir.mkdir(parents=True, exist_ok=True)
+
+        # Save images to disk and update markdown references
+        updated_markdown = markdown_text
+        for img_name, img_data in images.items():
+            try:
+                # Save image to temp directory
+                img_path = temp_img_dir / img_name
+                if hasattr(img_data, 'save'):
+                    # PIL Image object
+                    img_data.save(str(img_path))
+                elif isinstance(img_data, bytes):
+                    # Raw bytes
+                    with open(img_path, 'wb') as f:
+                        f.write(img_data)
+                else:
+                    logger.warning(f"Unknown image type for {img_name}: {type(img_data)}")
+                    continue
+
+                # Update markdown to use absolute path with forward slashes (Windows compatible)
+                # Replace relative references like ![...](img_name) with absolute path
+                img_path_str = str(img_path).replace('\\', '/')
+                updated_markdown = updated_markdown.replace(
+                    f"]({img_name})",
+                    f"]({img_path_str})"
+                )
+                logger.info(f"Saved image: {img_path}")
+            except Exception as img_err:
+                logger.warning(f"Failed to save image {img_name}: {img_err}")
+
+        # Convert Markdown to Word using pypandoc
+        try:
+            import pypandoc
+
+            # Ensure pandoc is available
+            pypandoc.ensure_pandoc_installed()
+
+            logger.info("Converting Markdown to Word with pypandoc...")
+            # Change to temp dir so relative paths work
+            import os
+            original_cwd = os.getcwd()
+            os.chdir(str(temp_img_dir))
+
+            try:
+                pypandoc.convert_text(
+                    updated_markdown,
+                    'docx',
+                    format='md',
+                    outputfile=str(output_path),
+                    extra_args=['--standalone', f'--resource-path={str(temp_img_dir)}']
+                )
+            finally:
+                os.chdir(original_cwd)
+
+            logger.info(f"marker-pdf conversion complete: {output_path}")
+
+        except Exception as pandoc_error:
+            logger.warning(f"Pypandoc failed: {pandoc_error}, falling back to manual conversion")
+            # Fallback: Create Word doc manually from markdown with images
+            _markdown_to_word_manual(updated_markdown, images, output_path, temp_img_dir)
+
+        # Cleanup temp images
+        try:
+            import shutil
+            shutil.rmtree(temp_img_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    except ImportError as e:
+        logger.error(f"marker-pdf not installed: {e}")
+        raise ConversionError(
+            "marker-pdf is not installed. Install with: pip install marker-pdf"
+        ) from e
+    except Exception as e:
+        logger.error(f"marker-pdf conversion failed: {e}")
+        raise ConversionError(f"marker-pdf conversion failed: {e}") from e
+
+
+def _markdown_to_word_manual(markdown_text: str, images: dict, output_path: Path, temp_img_dir: Path = None) -> None:
+    """Convert Markdown to Word manually when pypandoc fails."""
+    from docx import Document
+    from docx.shared import Inches, Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    import re
+
+    doc = Document()
+
+    # Simple markdown parsing
+    lines = markdown_text.split('\n')
+    in_table = False
+    table_rows = []
+
+    for line in lines:
+        line = line.strip()
+
+        # Skip empty lines
+        if not line:
+            if in_table and table_rows:
+                _add_markdown_table(doc, table_rows)
+                table_rows = []
+                in_table = False
+            continue
+
+        # Headers
+        if line.startswith('# '):
+            doc.add_heading(line[2:], level=1)
+        elif line.startswith('## '):
+            doc.add_heading(line[3:], level=2)
+        elif line.startswith('### '):
+            doc.add_heading(line[4:], level=3)
+        # Images - ![alt](path)
+        elif line.startswith('!['):
+            match = re.match(r'!\[([^\]]*)\]\(([^)]+)\)', line)
+            if match:
+                alt_text, img_path = match.groups()
+                try:
+                    img_path_obj = Path(img_path)
+                    if img_path_obj.exists():
+                        doc.add_picture(str(img_path_obj), width=Inches(4))
+                        logger.info(f"Added image: {img_path}")
+                    elif temp_img_dir:
+                        # Try finding in temp dir
+                        img_name = img_path_obj.name
+                        temp_path = temp_img_dir / img_name
+                        if temp_path.exists():
+                            doc.add_picture(str(temp_path), width=Inches(4))
+                            logger.info(f"Added image from temp: {temp_path}")
+                        else:
+                            doc.add_paragraph(f"[Image: {alt_text or img_name}]")
+                    else:
+                        doc.add_paragraph(f"[Image: {alt_text or img_path}]")
+                except Exception as img_err:
+                    logger.warning(f"Failed to add image {img_path}: {img_err}")
+                    doc.add_paragraph(f"[Image: {alt_text or img_path}]")
+        # Table rows
+        elif line.startswith('|') and line.endswith('|'):
+            in_table = True
+            # Skip separator rows (only dashes, colons, spaces, pipes)
+            stripped = line.replace('|', '').replace('-', '').replace(':', '').replace(' ', '')
+            if stripped:  # Not a separator
+                cells = [c.strip() for c in line.split('|')[1:-1]]
+                if cells:
+                    table_rows.append(cells)
+        # Regular paragraph
+        else:
+            if in_table and table_rows:
+                _add_markdown_table(doc, table_rows)
+                table_rows = []
+                in_table = False
+            # Clean up markdown formatting
+            text = re.sub(r'\*\*(.+?)\*\*', r'\1', line)  # Bold
+            text = re.sub(r'\*(.+?)\*', r'\1', text)  # Italic
+            text = re.sub(r'`(.+?)`', r'\1', text)  # Code
+            # Remove image references that weren't caught
+            text = re.sub(r'!\[[^\]]*\]\([^)]+\)', '', text)
+            if text.strip():
+                doc.add_paragraph(text)
+
+    # Handle remaining table
+    if table_rows:
+        _add_markdown_table(doc, table_rows)
+
+    doc.save(str(output_path))
+    logger.info(f"Manual markdown to Word conversion complete: {output_path}")
+
+
+def _add_markdown_table(doc, rows):
+    """Add a table from markdown rows to Word document."""
+    if not rows:
+        return
+
+    num_cols = max(len(row) for row in rows)
+    table = doc.add_table(rows=len(rows), cols=num_cols)
+    table.style = 'Table Grid'
+
+    for i, row in enumerate(rows):
+        for j, cell_text in enumerate(row):
+            if j < len(table.rows[i].cells):
+                table.rows[i].cells[j].text = cell_text
+
+    doc.add_paragraph()  # Space after table
+
+
+def convert_pdf_to_word(input_path: Path, output_path: Path, engine: str = "auto") -> None:
     """Convert PDF to Word document.
-
-    Uses pdf2docx for high-fidelity conversion that preserves:
-    - Tables
-    - Images and logos
-    - Text formatting
-    - Layout positioning
-
-    Falls back to OCR for image-based (scanned) PDFs.
 
     Args:
         input_path: Path to the input PDF file.
         output_path: Path where the output DOCX will be saved.
+        engine: Conversion engine to use:
+            - "auto": Automatically select based on PDF type (default)
+            - "marker": Use marker-pdf for professional-grade conversion (recommended)
+            - "pdf2docx": Use pdf2docx for text-based PDFs
+            - "doctr": Use doctr OCR for scanned PDFs
 
     Raises:
         ConversionError: If conversion fails.
     """
     try:
-        logger.info(f"convert_pdf_to_word called with input: {input_path}")
-        pdf_doc = fitz.open(str(input_path))
+        logger.info(f"convert_pdf_to_word called with input: {input_path}, engine: {engine}")
 
-        is_image_based = is_image_based_pdf(pdf_doc)
-        logger.info(f"is_image_based_pdf result: {is_image_based}")
-        pdf_doc.close()
-
-        if is_image_based:
-            # For scanned/image-based PDFs, use doctr for OCR
-            logger.info("Using doctr conversion for image-based PDF")
+        # If specific engine requested, use it directly
+        if engine == "marker":
+            logger.info("Using marker-pdf engine (user requested)")
+            convert_pdf_to_word_marker(input_path, output_path)
+        elif engine == "pdf2docx":
+            logger.info("Using pdf2docx engine (user requested)")
+            convert_pdf_to_word_pdf2docx(input_path, output_path)
+        elif engine == "doctr":
+            logger.info("Using doctr engine (user requested)")
             convert_pdf_to_word_doctr(input_path, output_path)
         else:
-            # For text-based PDFs, use pdf2docx which preserves original formatting better
-            logger.info("Using pdf2docx for text-based PDF")
-            convert_pdf_to_word_pdf2docx(input_path, output_path)
+            # Auto mode: detect PDF type and choose best engine
+            pdf_doc = fitz.open(str(input_path))
+            is_image_based = is_image_based_pdf(pdf_doc)
+            logger.info(f"is_image_based_pdf result: {is_image_based}")
+            pdf_doc.close()
+
+            if is_image_based:
+                # For scanned/image-based PDFs, use doctr for OCR
+                logger.info("Auto: Using doctr for image-based PDF")
+                convert_pdf_to_word_doctr(input_path, output_path)
+            else:
+                # For text-based PDFs, use pdf2docx
+                logger.info("Auto: Using pdf2docx for text-based PDF")
+                convert_pdf_to_word_pdf2docx(input_path, output_path)
 
         logger.info(f"Conversion complete, output: {output_path}")
 
@@ -1408,6 +1763,7 @@ def convert_file(
     input_path: Path,
     conversion_type: ConversionType,
     output_filename: str | None = None,
+    engine: str = "auto",
 ) -> Path:
     """Convert a file based on the specified conversion type.
 
@@ -1415,6 +1771,11 @@ def convert_file(
         input_path: Path to the input file.
         conversion_type: Type of conversion to perform.
         output_filename: Optional custom output filename.
+        engine: For PDF to Word conversion, which engine to use:
+            - "auto": Automatically select based on PDF type
+            - "marker": Use marker-pdf (professional-grade)
+            - "pdf2docx": Use pdf2docx
+            - "doctr": Use doctr OCR
 
     Returns:
         Path to the converted file.
@@ -1433,15 +1794,17 @@ def convert_file(
         output_path = OUTPUT_DIR / (input_path.stem + "_converted" + output_ext)
 
     # Perform conversion
-    converters = {
-        ConversionType.PDF_TO_WORD: convert_pdf_to_word,
-        ConversionType.WORD_TO_PDF: convert_word_to_pdf,
-        ConversionType.WORD_TO_EXCEL: convert_word_to_excel,
-        ConversionType.EXCEL_TO_WORD: convert_excel_to_word,
-    }
-
-    converter_func = converters[conversion_type]
-    converter_func(input_path, output_path)
+    if conversion_type == ConversionType.PDF_TO_WORD:
+        # PDF to Word supports engine selection
+        convert_pdf_to_word(input_path, output_path, engine=engine)
+    elif conversion_type == ConversionType.WORD_TO_PDF:
+        convert_word_to_pdf(input_path, output_path)
+    elif conversion_type == ConversionType.WORD_TO_EXCEL:
+        convert_word_to_excel(input_path, output_path)
+    elif conversion_type == ConversionType.EXCEL_TO_WORD:
+        convert_excel_to_word(input_path, output_path)
+    else:
+        raise ConversionError(f"Unsupported conversion type: {conversion_type}")
 
     if not output_path.exists():
         raise ConversionError("Conversion completed but output file not found")

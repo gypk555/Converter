@@ -19,9 +19,19 @@ const OUTPUT_EXTENSIONS: Record<ConversionType, string> = {
   excel_to_word: '.docx',
 };
 
+type EngineType = 'auto' | 'marker' | 'pdf2docx' | 'doctr';
+
+const ENGINE_OPTIONS: { value: EngineType; label: string; description: string }[] = [
+  { value: 'auto', label: 'Auto', description: 'Automatically select best engine' },
+  { value: 'marker', label: 'Marker (Professional)', description: 'Best quality, ML-based conversion' },
+  { value: 'pdf2docx', label: 'PDF2DOCX', description: 'Fast, good for text PDFs' },
+  { value: 'doctr', label: 'DocTR (OCR)', description: 'For scanned documents' },
+];
+
 export function Converter() {
   const [formats, setFormats] = useState<ConversionFormat[]>([]);
   const [selectedType, setSelectedType] = useState<ConversionType>('pdf_to_word');
+  const [selectedEngine, setSelectedEngine] = useState<EngineType>('auto');
   const [file, setFile] = useState<File | null>(null);
   const [isConverting, setIsConverting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -89,7 +99,7 @@ export function Converter() {
 
     try {
       // Use sync endpoint (no Redis required)
-      const blob = await api.convertSync(file, selectedType);
+      const blob = await api.convertSync(file, selectedType, selectedEngine);
 
       // Create download link
       const url = window.URL.createObjectURL(blob);
@@ -122,7 +132,7 @@ export function Converter() {
     } finally {
       setIsConverting(false);
     }
-  }, [file, selectedType]);
+  }, [file, selectedType, selectedEngine]);
 
   const selectedFormat = formats.find(f => f.type === selectedType);
 
@@ -192,6 +202,25 @@ export function Converter() {
             </label>
           </div>
         </section>
+
+        {/* Engine Selection (for PDF to Word only) */}
+        {selectedType === 'pdf_to_word' && (
+          <section className="engine-selection">
+            <h2>Conversion Engine</h2>
+            <div className="engine-grid">
+              {ENGINE_OPTIONS.map((engine) => (
+                <button
+                  key={engine.value}
+                  className={`engine-card ${selectedEngine === engine.value ? 'selected' : ''}`}
+                  onClick={() => setSelectedEngine(engine.value)}
+                >
+                  <span className="engine-label">{engine.label}</span>
+                  <span className="engine-description">{engine.description}</span>
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
 
         {/* Convert Button */}
         <section className="convert-action">

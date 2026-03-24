@@ -403,14 +403,32 @@ async def download_converted_file(task_id: str):
 async def convert_sync(
     file: UploadFile = File(..., description="File to convert"),
     conversion_type: ConversionType = Form(..., description="Type of conversion"),
+    engine: str = Form(
+        default="auto",
+        description="PDF to Word engine: 'auto', 'marker' (professional), 'pdf2docx', or 'doctr'"
+    ),
 ):
     """Convert a file synchronously (without Celery/Redis).
 
     Use this endpoint for testing or when Redis is not available.
     For production, use /convert/upload with background processing.
+
+    For PDF to Word conversions, you can select the conversion engine:
+    - auto: Automatically select based on PDF type (default)
+    - marker: Use marker-pdf for professional-grade conversion (recommended)
+    - pdf2docx: Use pdf2docx library
+    - doctr: Use doctr OCR (for scanned documents)
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
+
+    # Validate engine parameter
+    valid_engines = ["auto", "marker", "pdf2docx", "doctr"]
+    if engine not in valid_engines:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid engine '{engine}'. Must be one of: {valid_engines}"
+        )
 
     # Generate unique filename
     file_ext = Path(file.filename).suffix
@@ -427,7 +445,7 @@ async def convert_sync(
 
     # Perform conversion synchronously
     try:
-        output_path = convert_file(upload_path, conversion_type)
+        output_path = convert_file(upload_path, conversion_type, engine=engine)
 
         # Clean up input file
         if upload_path.exists():

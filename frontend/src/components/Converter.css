@@ -195,6 +195,58 @@
   font-size: 0.875rem;
 }
 
+/* Engine Selection */
+.engine-selection {
+  margin-bottom: 2rem;
+}
+
+.engine-selection h2 {
+  font-size: 1.25rem;
+  color: #333;
+  margin-bottom: 1rem;
+}
+
+.engine-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+}
+
+.engine-card {
+  padding: 1rem;
+  border: 2px solid #e0e0e0;
+  border-radius: 10px;
+  background: white;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  text-align: left;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.engine-card:hover {
+  border-color: #4a90d9;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(74, 144, 217, 0.15);
+}
+
+.engine-card.selected {
+  border-color: #4a90d9;
+  background: #f0f7ff;
+}
+
+.engine-label {
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: #333;
+}
+
+.engine-description {
+  font-size: 0.75rem;
+  color: #666;
+}
+
 /* Convert Button */
 .convert-action {
   text-align: center;

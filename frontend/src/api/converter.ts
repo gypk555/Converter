@@ -51,10 +51,11 @@ export const api = {
     return `${API_BASE_URL}/convert/download/${taskId}`;
   },
 
-  async convertSync(file: File, conversionType: string): Promise<Blob> {
+  async convertSync(file: File, conversionType: string, engine: string = 'auto'): Promise<Blob> {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('conversion_type', conversionType);
+    formData.append('engine', engine);
 
     const response = await axios.post(`${API_BASE_URL}/convert/sync`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
